@@ -13,11 +13,13 @@
   "dependencies": {
     "@langchain/core": "^1.2.11",
     "@langchain/langgraph": "^1.4.15",
+    "@napi-rs/canvas": "^1.0.9",
     "bullmq": "^6.3.6",
     "decimal.js": "^10.6.0",
     "dotenv": "^18.0.0",
     "fastify": "^5.12.5",
     "ioredis": "^6.0.0",
+    "pdfjs-dist": "^6.3.289",
     "pg": "^8.23.0"
   },
   "devDependencies": {
