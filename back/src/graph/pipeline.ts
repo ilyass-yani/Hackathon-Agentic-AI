@@ -3,8 +3,10 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Annotation, END, START, StateGraph, type NodeError, type Runtime } from '@langchain/langgraph';
 import { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres';
+import { Decimal } from 'decimal.js';
 import pg from 'pg';
 import { extraireDocument, type ExtractedInvoice } from '../lib/extraction.js';
+import { rapprocher, type FactureCandidate, type ResultatRapprochement } from '../lib/reconciliation.js';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 config({ path: resolve(scriptDir, '../../../.env') });
@@ -31,7 +33,9 @@ export const PipelineState = Annotation.Root({
   typeEchec: Annotation<'technique' | 'metier' | null>,
 });
 
-const INGESTOR_MAX_ATTEMPTS = 3;
+// Même politique pour ingestor et reconciler : maxAttempts=3, mêmes raisons
+// (distinguer erreur technique retryable de résultat métier normal).
+const NODE_MAX_ATTEMPTS = 3;
 
 // Pool dédié aux écritures Postgres du nœud ingestor — distinct du pool interne du
 // checkpointer (privé à PostgresSaver, pas exposé pour des requêtes arbitraires).
@@ -47,7 +51,7 @@ async function ingestor(
   runtime: Runtime,
 ): Promise<Partial<typeof PipelineState.State>> {
   const attempt = runtime.executionInfo?.nodeAttempt ?? 1;
-  console.log(`Node ingestor: document ${state.documentId} (tentative ${attempt}/${INGESTOR_MAX_ATTEMPTS})`);
+  console.log(`Node ingestor: document ${state.documentId} (tentative ${attempt}/${NODE_MAX_ATTEMPTS})`);
 
   const resultat = await extraireDocument(state.cheminFichier);
 
@@ -113,9 +117,165 @@ async function ingestor(
   };
 }
 
+// Écrit le résultat d'un rapprocher() en base. Upsert via la clé naturelle
+// (document_id, releve_ligne_id) sur rapprochement_ligne (contrainte UNIQUE ajoutée
+// par migration) : rapprochement lui-même n'a pas de document_id direct (c'est une
+// enveloppe de groupe, potentiellement partagée entre plusieurs documents d'un
+// paiement groupé) — on retrouve un rapprochement existant pour CE document via ses
+// éventuelles rapprochement_ligne d'un run précédent.
+//
+// Limitation connue et acceptée pour cette étape : pour 'non_rapproche', il n'y a
+// aucune releve_ligne à lier, donc aucune rapprochement_ligne écrite — et sans elle,
+// aucune clé ne permet de retrouver "le" rapprochement non_rapproche déjà écrit pour
+// ce document lors d'un run précédent. Un re-traitement d'un document en
+// non_rapproche crée donc un nouveau rapprochement orphelin à chaque fois. À revoir
+// avant le passage à l'échelle sur les 107 documents si ça devient gênant.
+async function ecrireRapprochement(
+  documentId: number,
+  releveLigneId: number | null,
+  resultat: ResultatRapprochement,
+): Promise<void> {
+  // rapprochement_id/id sont des BIGINT -> string côté node-postgres, jamais number
+  // par défaut ; Number(...) explicite pour rester cohérent avec le reste du fichier.
+  const existant = await pool.query<{ rapprochement_id: string }>(
+    `SELECT DISTINCT rapprochement_id FROM rapprochement_ligne WHERE document_id = $1`,
+    [documentId],
+  );
+
+  let rapprochementId: number;
+  if (existant.rows.length > 0) {
+    rapprochementId = Number(existant.rows[0]!.rapprochement_id);
+    await pool.query(`UPDATE rapprochement SET statut = $1, updated_at = now() WHERE id = $2`, [
+      resultat.statut,
+      rapprochementId,
+    ]);
+    // rapprocher() est déterministe : recalculer depuis n'importe quel membre du
+    // groupe doit reproduire le même résultat pour tout le groupe, donc on peut
+    // réécrire les lignes sans perte d'information.
+    await pool.query(`DELETE FROM rapprochement_ligne WHERE rapprochement_id = $1`, [rapprochementId]);
+  } else {
+    const insere = await pool.query<{ id: string }>(`INSERT INTO rapprochement (statut) VALUES ($1) RETURNING id`, [
+      resultat.statut,
+    ]);
+    rapprochementId = Number(insere.rows[0]!.id);
+  }
+
+  if (releveLigneId !== null) {
+    for (const impute of resultat.montantImpute) {
+      await pool.query(
+        `INSERT INTO rapprochement_ligne (rapprochement_id, document_id, releve_ligne_id, montant_impute)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (document_id, releve_ligne_id) DO UPDATE SET
+           rapprochement_id = EXCLUDED.rapprochement_id,
+           montant_impute = EXCLUDED.montant_impute`,
+        [rapprochementId, impute.documentId, releveLigneId, impute.montant.toFixed(2)],
+      );
+    }
+  }
+}
+
+// Reconciler : appelle rapprocher() (back/src/lib/reconciliation.ts, fonction pure),
+// écrit le résultat en base. Ne s'exécute que sur un document déjà 'traite' par
+// l'ingestor — sans extraction fiable, rapprocher n'importe quoi n'aurait aucun sens.
+async function reconciler(
+  state: typeof PipelineState.State,
+  runtime: Runtime,
+): Promise<Partial<typeof PipelineState.State>> {
+  const attempt = runtime.executionInfo?.nodeAttempt ?? 1;
+  console.log(`Node reconciler: document ${state.documentId} (tentative ${attempt}/${NODE_MAX_ATTEMPTS})`);
+
+  if (state.statut !== 'traite' || !state.extraction) {
+    console.log(
+      `Node reconciler: document ${state.documentId} skip — statut='${state.statut}', pas de données fiables à rapprocher.`,
+    );
+    return {};
+  }
+
+  const { tiers, ttc, date } = state.extraction;
+  if (!tiers || ttc === null || !date) {
+    console.log(`Node reconciler: document ${state.documentId} skip — tiers/ttc/date manquant malgré statut='traite'.`);
+    return {};
+  }
+
+  // Lignes bancaires candidates pour ce fournisseur : même logique de matching que
+  // check-regroupements.ts (fournisseur_nom_brut <-> tiers, insensible à la casse),
+  // mais en sens inverse (on part de la facture, pas de la ligne) puisqu'on traite un
+  // document à la fois. Règle 9 : paiement jusqu'à 60 jours après la facture.
+  const lignesCandidates = await pool.query<{ id: string; date: string; debit: string }>(
+    `SELECT id, date::text, debit::text
+     FROM releve_ligne
+     WHERE type_detecte = 'paiement_fournisseur'
+       AND debit IS NOT NULL
+       AND LOWER(TRIM(fournisseur_nom_brut)) = LOWER(TRIM($1))
+       AND date BETWEEN $2::date AND ($2::date + INTERVAL '60 days')
+     ORDER BY date`,
+    [tiers, date],
+  );
+
+  if (lignesCandidates.rows.length === 0) {
+    console.log(`Node reconciler: document ${state.documentId} -> non_rapproche (aucune ligne bancaire candidate).`);
+    await ecrireRapprochement(state.documentId, null, {
+      statut: 'non_rapproche',
+      documentIds: [],
+      montantImpute: [],
+      soldeRestant: null,
+    });
+    return {};
+  }
+
+  // Toutes les factures "sœurs" du même fournisseur : pool de candidats pour
+  // rapprocher(), qui fait lui-même son propre filtrage de fenêtre de 60 jours
+  // (avant chaque ligne bancaire candidate) — pas besoin de le refaire ici.
+  // node-postgres renvoie les colonnes BIGINT/BIGSERIAL (document_id, id) en string,
+  // pas en number (pour ne pas perdre de précision au-delà de Number.MAX_SAFE_INTEGER)
+  // — Number(...) explicite ici, sinon `documentIds.includes(state.documentId)` plus
+  // bas compare silencieusement une string à un number et ne matche jamais.
+  const facturesSoeurs = await pool.query<{ document_id: string; date: string; ttc: string }>(
+    `SELECT e.document_id, e.date::text, e.ttc::text
+     FROM extraction e
+     JOIN documents d ON d.id = e.document_id
+     WHERE d.statut_traitement = 'traite'
+       AND e.date IS NOT NULL
+       AND e.ttc IS NOT NULL
+       AND LOWER(TRIM(e.tiers)) = LOWER(TRIM($1))`,
+    [tiers],
+  );
+
+  const facturesCandidates: FactureCandidate[] = facturesSoeurs.rows.map((f) => ({
+    documentId: Number(f.document_id),
+    date: new Date(f.date),
+    ttc: new Decimal(f.ttc),
+  }));
+
+  let resultat: ResultatRapprochement | null = null;
+  let releveLigneId: number | null = null;
+
+  for (const ligne of lignesCandidates.rows) {
+    const candidat = rapprocher(tiers, new Decimal(ligne.debit), new Date(ligne.date), facturesCandidates);
+    if (candidat.statut !== 'non_rapproche' && candidat.documentIds.includes(state.documentId)) {
+      resultat = candidat;
+      releveLigneId = Number(ligne.id);
+      break;
+    }
+  }
+
+  if (!resultat) {
+    resultat = { statut: 'non_rapproche', documentIds: [], montantImpute: [], soldeRestant: null };
+  }
+
+  console.log(
+    `Node reconciler: document ${state.documentId} -> ${resultat.statut}` +
+      (resultat.documentIds.length > 1 ? ` (groupe: ${resultat.documentIds.join(', ')})` : ''),
+  );
+
+  await ecrireRapprochement(state.documentId, releveLigneId, resultat);
+
+  return {};
+}
+
 const graph = new StateGraph(PipelineState)
   .addNode('ingestor', ingestor, {
-    retryPolicy: { maxAttempts: INGESTOR_MAX_ATTEMPTS },
+    retryPolicy: { maxAttempts: NODE_MAX_ATTEMPTS },
     // N'est appelé qu'une fois le retryPolicy épuisé (jamais pour un doute métier,
     // qui ne lève pas d'exception) : c'est ici, et seulement ici, qu'on persiste
     // proprement l'échec technique dans le state plutôt que de laisser l'exception
@@ -125,13 +285,26 @@ const graph = new StateGraph(PipelineState)
     // sera un nœud séparé, pas encore écrit.
     errorHandler: (_state: typeof PipelineState.State, error: NodeError) => {
       console.log(
-        `Node ingestor: échec technique après ${INGESTOR_MAX_ATTEMPTS} tentatives — ${error.error.message}`,
+        `Node ingestor: échec technique après ${NODE_MAX_ATTEMPTS} tentatives — ${error.error.message}`,
       );
-      return { typeEchec: 'technique', tentativesTechniques: INGESTOR_MAX_ATTEMPTS };
+      return { typeEchec: 'technique', tentativesTechniques: NODE_MAX_ATTEMPTS };
+    },
+  })
+  .addNode('reconciler', reconciler, {
+    retryPolicy: { maxAttempts: NODE_MAX_ATTEMPTS },
+    // Même raison que sur ingestor : une erreur Postgres/réseau ici est technique,
+    // pas un jugement sur le document. rapprocher() lui-même est pur (pas d'I/O),
+    // seules les requêtes/écritures autour peuvent échouer techniquement.
+    errorHandler: (_state: typeof PipelineState.State, error: NodeError) => {
+      console.log(
+        `Node reconciler: échec technique après ${NODE_MAX_ATTEMPTS} tentatives — ${error.error.message}`,
+      );
+      return { typeEchec: 'technique', tentativesTechniques: NODE_MAX_ATTEMPTS };
     },
   })
   .addEdge(START, 'ingestor')
-  .addEdge('ingestor', END);
+  .addEdge('ingestor', 'reconciler')
+  .addEdge('reconciler', END);
 
 async function buildCheckpointedGraph(): Promise<{ app: ReturnType<typeof graph.compile>; checkpointer: PostgresSaver }> {
   // PostgresSaver a besoin de ses propres tables internes (checkpoints,
