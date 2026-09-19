@@ -3,6 +3,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Annotation, END, START, StateGraph, type NodeError, type Runtime } from '@langchain/langgraph';
 import { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres';
+import pg from 'pg';
+import { extraireDocument, type ExtractedInvoice } from '../lib/extraction.js';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 config({ path: resolve(scriptDir, '../../../.env') });
@@ -16,7 +18,7 @@ export const PipelineState = Annotation.Root({
   documentId: Annotation<number>,
   cheminFichier: Annotation<string>,
   statut: Annotation<string>,
-  extraction: Annotation<Record<string, unknown> | null>,
+  extraction: Annotation<ExtractedInvoice | null>,
   motifEchec: Annotation<string | null>,
   anomalies: Annotation<unknown[]>,
   erreurs: Annotation<string[]>,
@@ -31,35 +33,105 @@ export const PipelineState = Annotation.Root({
 
 const INGESTOR_MAX_ATTEMPTS = 3;
 
-// Placeholder : ne fait aucun vrai traitement de fond, juste la preuve que le nœud
-// s'exécute et que le state se propage. Le vrai Ingestor (test-ocr.ts) sera branché
-// plus tard, avec la même politique de retry/erreur que celle configurée ici.
-async function ingestorPlaceholder(
+// Pool dédié aux écritures Postgres du nœud ingestor — distinct du pool interne du
+// checkpointer (privé à PostgresSaver, pas exposé pour des requêtes arbitraires).
+const pool = new pg.Pool({ connectionString: DATABASE_URL });
+
+// Ingestor : appelle la vraie logique d'extraction (back/src/lib/extraction.ts), ne
+// duplique rien. Une erreur technique (réseau/API/Postgres transitoire) n'est jamais
+// catchée ici : elle remonte telle quelle, le retryPolicy + errorHandler ci-dessous
+// s'en chargent (déjà testés sur le placeholder, logique inchangée). Un résultat
+// métier normal (même statut='non_traite') n'est PAS une erreur : on écrit direct.
+async function ingestor(
   state: typeof PipelineState.State,
   runtime: Runtime,
 ): Promise<Partial<typeof PipelineState.State>> {
   const attempt = runtime.executionInfo?.nodeAttempt ?? 1;
-  console.log(`Node ingestor_placeholder: document ${state.documentId} (tentative ${attempt}/${INGESTOR_MAX_ATTEMPTS})`);
+  console.log(`Node ingestor: document ${state.documentId} (tentative ${attempt}/${INGESTOR_MAX_ATTEMPTS})`);
 
-  return { statut: 'traite' };
+  const resultat = await extraireDocument(state.cheminFichier);
+
+  // statut != 'traite' est un doute métier (contenu suspect ou illisible), jamais
+  // 'technique' ici : une erreur technique n'atteint jamais ce point (elle a throw
+  // plus haut et est gérée par retryPolicy/errorHandler, pas par ce chemin normal).
+  const typeEchec: 'metier' | null = resultat.statut === 'traite' ? null : 'metier';
+
+  await pool.query(
+    `UPDATE documents
+     SET statut_traitement = $1, motif_echec = $2, type_echec = $3
+     WHERE id = $4`,
+    [resultat.statut, resultat.motif, typeEchec, state.documentId],
+  );
+
+  // Upsert : un document a au plus une extraction (document_id UNIQUE), on écrase
+  // proprement si le document est retraité.
+  await pool.query(
+    `INSERT INTO extraction (
+       document_id, tiers, date, ht, tva, ttc, taux_tva, numero_piece,
+       ice_fournisseur, ice_client, confiance, score_nettete, nombre_appels_llm,
+       extraction_alternative
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+     ON CONFLICT (document_id) DO UPDATE SET
+       tiers = EXCLUDED.tiers,
+       date = EXCLUDED.date,
+       ht = EXCLUDED.ht,
+       tva = EXCLUDED.tva,
+       ttc = EXCLUDED.ttc,
+       taux_tva = EXCLUDED.taux_tva,
+       numero_piece = EXCLUDED.numero_piece,
+       ice_fournisseur = EXCLUDED.ice_fournisseur,
+       ice_client = EXCLUDED.ice_client,
+       confiance = EXCLUDED.confiance,
+       score_nettete = EXCLUDED.score_nettete,
+       nombre_appels_llm = EXCLUDED.nombre_appels_llm,
+       extraction_alternative = EXCLUDED.extraction_alternative,
+       updated_at = now()`,
+    [
+      state.documentId,
+      resultat.extraction?.tiers ?? null,
+      resultat.extraction?.date ?? null,
+      resultat.extraction?.ht ?? null,
+      resultat.extraction?.tva ?? null,
+      resultat.extraction?.ttc ?? null,
+      resultat.extraction?.taux_tva ?? null,
+      resultat.extraction?.numero_piece ?? null,
+      resultat.extraction?.ice_fournisseur ?? null,
+      resultat.extraction?.ice_client ?? null,
+      resultat.extraction?.confiance ?? null,
+      resultat.scoreNettete,
+      resultat.nombreAppelsLlm,
+      resultat.extractionAlternative ? JSON.stringify(resultat.extractionAlternative) : null,
+    ],
+  );
+
+  return {
+    statut: resultat.statut,
+    extraction: resultat.extraction,
+    motifEchec: resultat.motif,
+    typeEchec,
+  };
 }
 
 const graph = new StateGraph(PipelineState)
-  .addNode('ingestor_placeholder', ingestorPlaceholder, {
+  .addNode('ingestor', ingestor, {
     retryPolicy: { maxAttempts: INGESTOR_MAX_ATTEMPTS },
     // N'est appelé qu'une fois le retryPolicy épuisé (jamais pour un doute métier,
     // qui ne lève pas d'exception) : c'est ici, et seulement ici, qu'on persiste
     // proprement l'échec technique dans le state plutôt que de laisser l'exception
-    // remonter non gérée.
+    // remonter non gérée. Logique inchangée depuis le placeholder (déjà testée) :
+    // ne persiste que dans le state/checkpoint, pas dans Postgres — un problème
+    // réseau n'est pas un jugement sur le document, l'escalade humaine définitive
+    // sera un nœud séparé, pas encore écrit.
     errorHandler: (_state: typeof PipelineState.State, error: NodeError) => {
       console.log(
-        `Node ingestor_placeholder: échec technique après ${INGESTOR_MAX_ATTEMPTS} tentatives — ${error.error.message}`,
+        `Node ingestor: échec technique après ${INGESTOR_MAX_ATTEMPTS} tentatives — ${error.error.message}`,
       );
       return { typeEchec: 'technique', tentativesTechniques: INGESTOR_MAX_ATTEMPTS };
     },
   })
-  .addEdge(START, 'ingestor_placeholder')
-  .addEdge('ingestor_placeholder', END);
+  .addEdge(START, 'ingestor')
+  .addEdge('ingestor', END);
 
 async function buildCheckpointedGraph(): Promise<{ app: ReturnType<typeof graph.compile>; checkpointer: PostgresSaver }> {
   // PostgresSaver a besoin de ses propres tables internes (checkpoints,

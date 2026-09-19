@@ -1,113 +1,110 @@
-// Script JETABLE de validation du squelette LangGraph (state + checkpointer Postgres +
-// exécution d'un nœud). Ne branche PAS le vrai Ingestor. À supprimer après usage.
+// Script JETABLE de validation bout en bout du vrai pipeline (nœud ingestor branché
+// sur back/src/lib/extraction.ts). À supprimer après usage, jamais committé.
+//
+// Insère 3 documents de test, les traite via runPipeline() (le vrai graphe, pas
+// test-ocr.ts directement), puis vérifie en base : documents.statut_traitement/
+// type_echec, la table extraction, et les checkpoints du graphe.
 
 import { config } from 'dotenv';
-import { dirname, resolve } from 'node:path';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from 'pg';
-import { buildFreshApp, closePipelineConnection, runPipeline } from '../graph/pipeline.js';
+import { runPipeline } from '../graph/pipeline.js';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 config({ path: resolve(scriptDir, '../../../.env') });
 
-async function main(): Promise<void> {
-  const finalState = await runPipeline(999, 'test.pdf');
+function usageAndExit(): never {
+  console.error('Usage: npx tsx src/scripts/test-graph.ts <chemin-vers-dossier-factures>');
+  process.exit(1);
+}
 
-  console.log('=== State final ===');
-  console.log(JSON.stringify(finalState, null, 2));
+const TEST_FILES = ['DOC-060.pdf', 'DOC-061.jpg', 'DOC-039.jpg'];
+
+async function main(): Promise<void> {
+  const facturesDir = process.argv[2];
+  if (!facturesDir) {
+    usageAndExit();
+  }
 
   const client = new Client({ connectionString: process.env.DATABASE_URL });
   await client.connect();
-  try {
-    const tables = await client.query<{ table_name: string }>(
-      `SELECT table_name
-       FROM information_schema.tables
-       WHERE table_schema = 'public' AND table_name LIKE 'checkpoint%'
-       ORDER BY table_name`,
-    );
 
-    console.log('\n=== Tables créées par le checkpointer Postgres (setup()) ===');
-    for (const row of tables.rows) {
-      console.log(`- ${row.table_name}`);
+  try {
+    // Étape 3 : insertion des 3 documents de test (statut_traitement par défaut 'en_attente').
+    const documentIds: number[] = [];
+    for (const fileName of TEST_FILES) {
+      const cheminFichier = join(facturesDir, fileName);
+      const type = extname(fileName).slice(1).toLowerCase();
+      const inserted = await client.query<{ id: number }>(
+        `INSERT INTO documents (type, chemin_fichier) VALUES ($1, $2) RETURNING id`,
+        [type, cheminFichier],
+      );
+      const id = inserted.rows[0]!.id;
+      documentIds.push(id);
+      console.log(`Document inséré : id=${id} fichier=${fileName}`);
     }
 
-    const checkpointRows = await client.query(
-      `SELECT thread_id, checkpoint_ns, checkpoint_id
-       FROM checkpoints
-       WHERE thread_id = $1
-       ORDER BY checkpoint_id`,
-      ['document-999'],
-    );
+    // Étape 4 : traitement via le vrai graphe (runPipeline), pas test-ocr.ts.
+    console.log('\n=== Traitement via runPipeline() ===');
+    for (let i = 0; i < documentIds.length; i += 1) {
+      const id = documentIds[i]!;
+      const fileName = TEST_FILES[i]!;
+      const cheminFichier = join(facturesDir, fileName);
+      console.log(`\n--- Document id=${id} (${fileName}) ---`);
+      const finalState = await runPipeline(id, cheminFichier);
+      console.log(JSON.stringify(finalState, null, 2));
+    }
 
-    console.log("\n=== Lignes checkpoints pour thread_id='document-999' ===");
-    console.log(JSON.stringify(checkpointRows.rows, null, 2));
+    // Vérification 1 : documents.statut_traitement / type_echec
+    console.log('\n=== Vérification documents ===');
+    const documentsRows = await client.query(
+      `SELECT id, type, chemin_fichier, statut_traitement, type_echec, motif_echec
+       FROM documents
+       WHERE id = ANY($1)
+       ORDER BY id`,
+      [documentIds],
+    );
+    for (const row of documentsRows.rows) {
+      console.log(
+        `id=${row.id} fichier=${basename(row.chemin_fichier)} statut_traitement=${row.statut_traitement} type_echec=${row.type_echec} motif_echec=${row.motif_echec}`,
+      );
+    }
+
+    // Vérification 2 : table extraction
+    console.log('\n=== Vérification extraction ===');
+    const extractionRows = await client.query(
+      `SELECT document_id, tiers, date, ht, tva, ttc, taux_tva, numero_piece,
+              ice_fournisseur, ice_client, confiance, score_nettete, nombre_appels_llm,
+              extraction_alternative IS NOT NULL AS a_une_alternative
+       FROM extraction
+       WHERE document_id = ANY($1)
+       ORDER BY document_id`,
+      [documentIds],
+    );
+    if (extractionRows.rows.length === 0) {
+      console.log('Aucune ligne dans extraction pour ces documents.');
+    }
+    for (const row of extractionRows.rows) {
+      console.log(JSON.stringify(row, null, 2));
+    }
+
+    // Vérification 3 : checkpoints du graphe pour ces 3 thread_id
+    console.log('\n=== Vérification checkpoints ===');
+    const threadIds = documentIds.map((id) => `document-${id}`);
+    const checkpointRows = await client.query<{ thread_id: string; count: string }>(
+      `SELECT thread_id, COUNT(*) AS count
+       FROM checkpoints
+       WHERE thread_id = ANY($1)
+       GROUP BY thread_id
+       ORDER BY thread_id`,
+      [threadIds],
+    );
+    for (const row of checkpointRows.rows) {
+      console.log(`${row.thread_id} : ${row.count} checkpoint(s)`);
+    }
   } finally {
     await client.end();
-  }
-
-  // Test de résilience au redémarrage — pattern inspiré de
-  // github.com/manuelbomi/LangGraph-based-Invoice-Receipt-Audit-Reconciliation-Assistant
-  // (même scénario : un document peut rester en attente de revue pendant qu'un
-  // worker redémarre, l'état doit survivre à la coupure de connexion).
-  console.log('\n=== Test de résilience au redémarrage (document-1000) ===');
-
-  const threadId = 'document-1000';
-  const stateBeforeRestart = await runPipeline(1000, 'test-resilience.pdf');
-  console.log('State avant "redémarrage" :');
-  console.log(JSON.stringify(stateBeforeRestart, null, 2));
-
-  // Fermeture complète de la connexion du checkpointer actuel — pas juste une
-  // nouvelle requête, un vrai pool.end() sous le capot.
-  await closePipelineConnection();
-  console.log('Connexion du checkpointer fermée (pool.end()).');
-
-  // Reconstruction à froid : nouveau checkpointer, nouvelle connexion Postgres,
-  // nouveau graphe compilé — exactement ce que ferait un worker qui redémarre.
-  const { app: freshApp, checkpointer: freshCheckpointer } = await buildFreshApp();
-  try {
-    const snapshot = await freshApp.getState({ configurable: { thread_id: threadId } });
-    const stateAfterRestart = snapshot.values;
-
-    console.log('State récupéré après "redémarrage" (nouvelle connexion) :');
-    console.log(JSON.stringify(stateAfterRestart, null, 2));
-
-    const identical = JSON.stringify(stateBeforeRestart) === JSON.stringify(stateAfterRestart);
-    if (identical) {
-      console.log('RÉSILIENT ✓ : état identique avant/après redémarrage simulé.');
-    } else {
-      console.log("PROBLÈME ✗ : l'état récupéré après redémarrage diffère de l'état avant fermeture de connexion.");
-    }
-  } finally {
-    await freshCheckpointer.end();
-  }
-
-  // Scénario (a) : échec technique — le nœud échoue systématiquement, doit retry
-  // jusqu'à épuisement (3 tentatives), puis persister typeEchec='technique' sans
-  // exception non gérée.
-  console.log('\n=== Scénario (a) : échec technique (document-1001) ===');
-  const technicalState = await runPipeline(1001, 'test-technique.pdf');
-  console.log('State final :');
-  console.log(JSON.stringify(technicalState, null, 2));
-  if (technicalState.typeEchec === 'technique' && technicalState.tentativesTechniques === 3) {
-    console.log('RÉSULTAT ✓ : typeEchec=technique, tentativesTechniques=3, aucune exception non gérée.');
-  } else {
-    console.log(
-      `RÉSULTAT ✗ : attendu typeEchec='technique' et tentativesTechniques=3, obtenu typeEchec=${technicalState.typeEchec} tentativesTechniques=${technicalState.tentativesTechniques}.`,
-    );
-  }
-
-  // Scénario (b) : doute métier — pas une exception, une valeur métier normale.
-  // Aucun retry ne doit avoir lieu (une seule exécution loggée ci-dessus).
-  console.log('\n=== Scénario (b) : doute métier (document-1002) ===');
-  const businessState = await runPipeline(1002, 'test-metier.pdf');
-  console.log('State final :');
-  console.log(JSON.stringify(businessState, null, 2));
-  if (businessState.typeEchec === 'metier' && businessState.tentativesTechniques === 0) {
-    console.log('RÉSULTAT ✓ : typeEchec=metier dès la première exécution, tentativesTechniques=0 (aucun retry).');
-  } else {
-    console.log(
-      `RÉSULTAT ✗ : attendu typeEchec='metier' et tentativesTechniques=0, obtenu typeEchec=${businessState.typeEchec} tentativesTechniques=${businessState.tentativesTechniques}.`,
-    );
   }
 }
 
