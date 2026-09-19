@@ -145,3 +145,6 @@ vite.config.ts.timestamp-*
 
 dist/
 build/
+
+# OCR batch results
+back/src/scripts/ocr-results/

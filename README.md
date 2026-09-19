@@ -1,6 +1,6 @@
 # Hackathon-Agentic-AI
 Yani Ilyass 0 branch travail solitaire
--------------------------------------------------------------------------------------------------------------------------------
+
 installation et lancement : 
     mkdir -p back/src/agents back/src/lib back/src/db/migrations back/src/routes
     cd back
@@ -13,7 +13,9 @@ installation et lancement :
     cd front
     npm install
     cd ..
--------------------------------------------------------------------------------------------------------------------------------
+    
+
+
 test docker pour worker.ts et server.ts:
         docker compose up -d --build
         docker compose ps                          # les 5 services doivent être Up/healthy
@@ -33,6 +35,19 @@ test docker pour worker.ts et server.ts:
         curl http://localhost:3000/health/queue    # "completed" doit avoir augmenté de 1
 
         docker compose down                        # arrêt propre, pas d'erreur SIGTERM
--------------------------------------------------------------------------------------------------------------------------------
+
+premier test de l'ocr 
+npx tsx src/scripts/test-ocr.ts "../../sujet-03-chiffra/factures/DOC-060.pdf"
+npx tsx src/scripts/test-ocr.ts "../../sujet-03-chiffra/factures/DOC-061.jpg"
+npx tsx src/scripts/test-ocr.ts "../../sujet-03-chiffra/factures"
 
 
+
+installation pour migration postgres sql pur 
+cd back 
+npm install --save-dev node-pg-migrate
+
+
+
+cd back
+npm install @langchain/langgraph-checkpoint-postgres
