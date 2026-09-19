@@ -80,6 +80,35 @@ async function main(): Promise<void> {
   } finally {
     await freshCheckpointer.end();
   }
+
+  // Scénario (a) : échec technique — le nœud échoue systématiquement, doit retry
+  // jusqu'à épuisement (3 tentatives), puis persister typeEchec='technique' sans
+  // exception non gérée.
+  console.log('\n=== Scénario (a) : échec technique (document-1001) ===');
+  const technicalState = await runPipeline(1001, 'test-technique.pdf');
+  console.log('State final :');
+  console.log(JSON.stringify(technicalState, null, 2));
+  if (technicalState.typeEchec === 'technique' && technicalState.tentativesTechniques === 3) {
+    console.log('RÉSULTAT ✓ : typeEchec=technique, tentativesTechniques=3, aucune exception non gérée.');
+  } else {
+    console.log(
+      `RÉSULTAT ✗ : attendu typeEchec='technique' et tentativesTechniques=3, obtenu typeEchec=${technicalState.typeEchec} tentativesTechniques=${technicalState.tentativesTechniques}.`,
+    );
+  }
+
+  // Scénario (b) : doute métier — pas une exception, une valeur métier normale.
+  // Aucun retry ne doit avoir lieu (une seule exécution loggée ci-dessus).
+  console.log('\n=== Scénario (b) : doute métier (document-1002) ===');
+  const businessState = await runPipeline(1002, 'test-metier.pdf');
+  console.log('State final :');
+  console.log(JSON.stringify(businessState, null, 2));
+  if (businessState.typeEchec === 'metier' && businessState.tentativesTechniques === 0) {
+    console.log('RÉSULTAT ✓ : typeEchec=metier dès la première exécution, tentativesTechniques=0 (aucun retry).');
+  } else {
+    console.log(
+      `RÉSULTAT ✗ : attendu typeEchec='metier' et tentativesTechniques=0, obtenu typeEchec=${businessState.typeEchec} tentativesTechniques=${businessState.tentativesTechniques}.`,
+    );
+  }
 }
 
 main().catch((error: unknown) => {
